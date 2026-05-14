@@ -1,4 +1,13 @@
-node_modules/
 .env
 *.log
-bun.lockb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.python-version-local
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
