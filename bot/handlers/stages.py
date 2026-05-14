@@ -32,10 +32,11 @@ from ..visits import (
 from .visit_start import open_visit_menu
 
 PHOTO_LIMIT = 10
+BRIEFING_QUESTION_COUNT = 10
 
 # States where Done/Skip should appear (vs Done only) after a save acknowledgement.
 _FREE_INPUT_WITH_SKIP = {"stage:arrival", "stage:completion:comment"}
-_FREE_INPUT_NO_SKIP = {"stage:briefing", "stage:specialist:extras"}
+_FREE_INPUT_NO_SKIP = {"stage:briefing:notes", "stage:specialist:extras"}
 _PICKER_STATES = {
     "stage:briefing:category",
     "stage:specialist:equipment",
@@ -44,6 +45,31 @@ _PICKER_STATES = {
     "stage:specialist:quality",
     "stage:completion:outcome",
 }
+
+
+def _briefing_q_state(n: int) -> str:
+    return f"stage:briefing:q:{n}"
+
+
+def _is_briefing_q_state(state: Optional[str]) -> bool:
+    return bool(state) and state.startswith("stage:briefing:q:")  # type: ignore[union-attr]
+
+
+def _briefing_q_n(state: str) -> int:
+    return int(state.rsplit(":", 1)[1])
+
+
+def _briefing_question(lang: str, category: str, n: int) -> str:
+    return t(lang, f"briefing_q_{category}_{n}")
+
+
+def _briefing_prompt(lang: str, category: str, n: int) -> str:
+    cat = t(lang, f"cat_{category}")
+    return f"{t(lang, 'briefing_progress', n=n, category=cat)}\n\n{_briefing_question(lang, category, n)}"
+
+
+def _briefing_payload(category: str, answers: list[dict]) -> dict:
+    return {"category": category, "answers": answers}
 
 
 def _ensure_visit_id(profile: Profile, tg_id: int) -> Optional[str]:
@@ -163,11 +189,19 @@ async def handle_stage_text(
         await message.answer(t(lang, "use_buttons_hint"))
         return True
 
-    if state in ("stage:arrival", "stage:briefing"):
-        stage_type = "arrival" if state == "stage:arrival" else "briefing"
-        upsert_stage(visit_id, stage_type, text_note=text)
-        with_skip = state in _FREE_INPUT_WITH_SKIP
-        await message.answer(t(lang, "stage_saved_more"), reply_markup=done_or_skip(lang, with_skip))
+    # Briefing questionnaire: each text answer advances to the next question.
+    if _is_briefing_q_state(state):
+        await _advance_briefing(message, profile, text)
+        return True
+
+    if state == "stage:arrival":
+        upsert_stage(visit_id, "arrival", text_note=text)
+        await message.answer(t(lang, "stage_saved_more"), reply_markup=done_or_skip(lang, True))
+        return True
+
+    if state == "stage:briefing:notes":
+        upsert_stage(visit_id, "briefing", text_note=text)
+        await message.answer(t(lang, "stage_saved_more"), reply_markup=done_or_skip(lang, False))
         return True
 
     if state == "stage:specialist:name":
@@ -238,9 +272,64 @@ async def handle_briefing_category_pick(
     visit_id: Optional[str] = ctx.get("visit_id")
     if not visit_id:
         return
-    upsert_stage(visit_id, "briefing", payload={"category": category})
-    set_session(tg_id, "stage:briefing", {**ctx, "briefing_category": category})
-    await _edit_or_send(event, t(lang, "briefing_prompt"), done_or_skip(lang, False))
+    answers: list[dict] = []
+    upsert_stage(visit_id, "briefing", payload=_briefing_payload(category, answers))
+    set_session(
+        tg_id,
+        _briefing_q_state(1),
+        {**ctx, "briefing_category": category, "briefing_answers": answers},
+    )
+    await _edit_or_send(event, _briefing_prompt(lang, category, 1), skip_back(lang))
+
+
+async def _advance_briefing(
+    event_or_message,
+    profile: Profile,
+    answer: Optional[str],
+) -> None:
+    """Append the (optional) answer to the current briefing question, then move to
+    the next question or to the notes step if all 10 are answered.
+
+    Accepts either a CallbackQuery (Skip click) or a Message (text answer)."""
+    lang = norm_lang(profile.language)
+    is_callback = isinstance(event_or_message, CallbackQuery)
+    user = event_or_message.from_user
+    if user is None:
+        return
+    tg_id = user.id
+    session = get_session(tg_id)
+    ctx = (session.context if session else {}) or {}
+    state = session.state if session else ""
+    visit_id: Optional[str] = ctx.get("visit_id")
+    category: Optional[str] = ctx.get("briefing_category")
+    if not (visit_id and category and _is_briefing_q_state(state)):
+        return
+
+    n = _briefing_q_n(state)
+    question_text = _briefing_question(lang, category, n)
+    answers = list(ctx.get("briefing_answers") or [])
+    answers.append({"q": question_text, "a": answer})
+    upsert_stage(visit_id, "briefing", payload=_briefing_payload(category, answers))
+
+    if n < BRIEFING_QUESTION_COUNT:
+        new_state = _briefing_q_state(n + 1)
+        new_ctx = {**ctx, "briefing_answers": answers}
+        set_session(tg_id, new_state, new_ctx)
+        next_prompt = _briefing_prompt(lang, category, n + 1)
+        if is_callback:
+            await _edit_or_send(event_or_message, next_prompt, skip_back(lang))
+        else:
+            await event_or_message.answer(next_prompt, reply_markup=skip_back(lang))
+        return
+
+    # All 10 answered → notes step
+    new_ctx = {**ctx, "briefing_answers": answers}
+    set_session(tg_id, "stage:briefing:notes", new_ctx)
+    notes_prompt = t(lang, "briefing_notes_prompt")
+    if is_callback:
+        await _edit_or_send(event_or_message, notes_prompt, done_or_skip(lang, False))
+    else:
+        await event_or_message.answer(notes_prompt, reply_markup=done_or_skip(lang, False))
 
 
 async def handle_specialist_pick(
@@ -302,9 +391,13 @@ async def handle_stage_photo(message: Message, profile: Profile, state: str, fil
         await message.answer(t(lang, "use_buttons_hint"))
         return True
 
+    # Briefing is text-only: redirect photo uploads to the arrival stage.
+    if state == "stage:briefing:notes" or _is_briefing_q_state(state):
+        await message.answer(t(lang, "photo_briefing_redirect"))
+        return True
+
     stage_map = {
         "stage:arrival": "arrival",
-        "stage:briefing": "briefing",
         "stage:specialist:extras": "specialist",
         "stage:completion:comment": "completion",
     }
@@ -376,6 +469,10 @@ async def handle_stage_skip(event: CallbackQuery, profile: Profile) -> None:
     ctx = (session.context if session else {}) or {}
     visit_id = ctx.get("visit_id")
     state = session.state if session else None
+
+    if _is_briefing_q_state(state):
+        await _advance_briefing(event, profile, None)
+        return
 
     if state == "stage:specialist:position":
         set_session(tg_id, "stage:specialist:phone", ctx)
